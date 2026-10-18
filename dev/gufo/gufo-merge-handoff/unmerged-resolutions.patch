@@ -1,0 +1,978 @@
+diff --cc CMakeLists.txt
+index ddabe5b8,5caa9fbd..00000000
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@@ -262,19 -257,13 +262,20 @@@ add_executable(guf
+    src/cli/serve/serve.cpp
+    src/cli/serve/continuation_cache.cpp
+    src/cli/serve/continuation_disk_store.cpp
++   src/cli/serve/component_text_cache.cpp
+    src/cli/serve/text_model_runner.cpp
+    src/cli/serve/text_generation_scheduler.cpp
+ +  src/cli/serve/tp_executor.cpp
+ +  src/cli/serve/tp_disk_store.cpp
+    src/cli/serve/inference_backend.cpp
+    src/eval/http_client.cpp
+  )
+ -target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
+ +target_link_libraries(gufo PRIVATE
+-   gufo_diagnostics gufo_core gufo_llm_cli gufo_http gufo_tp_control
+++  gufo_cache gufo_tp_control gufo_diagnostics gufo_core gufo_llm_cli gufo_http
+ +  CURL::libcurl)
+ +if (GUFO_ENABLE_TP2_RDMA)
+ +  target_compile_definitions(gufo PRIVATE GUFO_ENABLE_TP2_RDMA=1)
+ +endif()
+  target_compile_definitions(gufo PRIVATE
+    GUFO_RELEASE_VERSION="${GUFO_RELEASE_VERSION}"
+    GUFO_REVISION="${GUFO_REVISION}"
+diff --cc cmake/Checks.cmake
+index caf2ec22,bbade27c..00000000
+--- a/cmake/Checks.cmake
++++ b/cmake/Checks.cmake
+@@@ -18,8 -19,8 +19,8 @@@ set(gufo_pr_target
+    quote_tracker_test
+    openai_chat_test http_server_test trace_test audio_websocket_test
+    text_generation_scheduler_test
+-   text_model_runner_test continuation_disk_store_test
++   component_text_cache_test text_model_runner_test continuation_disk_store_test
+ -  bench_cli_test prompt_cli_test eval_http_client_test
+ +  bench_cli_test prompt_cli_test eval_http_client_test tp_control_test
+    qwen_tokenizer_test qwen_chat_template_test
+    qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
+    qwen38_flash_next_continuation_layout_test
+diff --cc docs/models/qwen3.8-flash-next/BENCHMARKS.md
+index f3d95f5f,c2c1f898..00000000
+--- a/docs/models/qwen3.8-flash-next/BENCHMARKS.md
++++ b/docs/models/qwen3.8-flash-next/BENCHMARKS.md
+@@@ -2,16 -2,11 +2,20 @@@
+  
+  AMD Strix Halo `gfx1151`, 128 GB unified memory. Unsloth `UD-Q4_K_XL` target and
+  shared-Q8_0 MTP sidecar; Gufo uses adaptive MTP. HTTP, greedy, thinking off.
+ -Gufo single-user AR and MTP: October 13, 2026, production Nix builds of
+ +Positive gain favors Gufo.
+ +[Quality and measurement details](QUALITY.md#benchmark-method) · [Model identities](artifacts/model-identities.json)
+ +
+ +- [Single Strix Halo](#single-strix-halo): Gufo against llama.cpp.
+ +- [Two Strix Halos over RDMA](#two-strix-halos-over-rdma): Gufo RDMA against
+ +  Gufo on one host, deeper contexts, and the full Q8 model.
+ +
+ +## Single Strix Halo
+ +
+- Gufo: October 10, 2026, production Nix review build `25cdb2a1` of PR #518.
+++Gufo single-user AR and MTP: October 13, 2026, production builds of
++ PR #571, every depth: AR d16K/d64K and MTP d64K use `ac51031a`, which adds
++ the short W8A8 tail path those prompts (2,051–2,058 tokens) take; the other
++ rows use `0951ea2f`. Other Gufo tables retain October 10's
+ -production Nix review build `25cdb2a1` of PR #518.
+++production review build `25cdb2a1` of PR #518.
+  Reference results remain unchanged from September 22–23.
+  llama.cpp uses `b11069` for AR and `6fcaa16f` for MTP.
+  
+diff --cc src/cli/serve/inference_backend.cpp
+index ef712792,6c09dc12..00000000
+--- a/src/cli/serve/inference_backend.cpp
++++ b/src/cli/serve/inference_backend.cpp
+@@@ -44,8 -44,8 +48,9 @@@
+  #include "src/models/qwen/hip/detail/attention_policy.hpp"
+  #include "src/models/qwen/hip/dflash.hpp"
+  #include "src/models/qwen/hip/executor.hpp"
++ #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
+  #include "src/models/qwen38_flash_next/engine.hpp"
+ +#include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
+  #endif
+  
+  namespace gufo::server {
+@@@ -2594,8 -2429,11 +2567,12 @@@ public
+        : model_(std::move(model)),
+          max_context_(max_context),
+          use_mtp_(use_mtp),
+ -        max_draft_tokens_(max_draft_tokens) {
+ +        max_draft_tokens_(max_draft_tokens),
+ +        distributed_(model_->TpWorldSize() > 1) {
++     // The typed in-process API owns an immutable loaded model but need not
++     // supply file fingerprints when disk caching is disabled. Its model
++     // lifetime is an exact process-local identity; durable caches still
++     // require the validated full artifact fingerprints below.
+      if (!artifact_fingerprint.empty()) {
+        persistence_ = TextRunnerPersistenceDescriptor{
+            .compatibility_identity = QwenFlashNextCompatibilityIdentity(
+@@@ -2605,15 -2443,204 +2582,213 @@@
+            .payload_version =
+                models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
+        };
+ +      if (distributed_) {
+ +        // A TP rank's snapshot holds only its half of the split state.
+ +        const std::string rank =
+ +            "tp_rank=" + std::to_string(model_->TpRank()) +
+ +            "\ntp_world_size=" + std::to_string(model_->TpWorldSize()) + "\n";
+ +        auto& identity = persistence_->compatibility_identity;
+ +        identity.insert(identity.end(), rank.begin(), rank.end());
+ +      }
+-     }
+++      // After the rank suffix above, so a TP rank caches under its own key.
++       component_identity_ = persistence_->compatibility_identity;
++     } else {
++       std::ostringstream identity;
++       identity << "schema=gufo-process-text-continuation-v1\n"
++                << "model_instance=" << model_.get() << '\n'
++                << "context_tokens=" << max_context_ << '\n'
++                << "mtp=" << use_mtp_ << '\n'
++                << "draft_max_tokens=" << max_draft_tokens_ << '\n'
++                << "draft_cost_concurrency=" << model_->DecodeConcurrency()
++                << '\n';
++       const auto canonical = identity.str();
++       component_identity_.assign(canonical.begin(), canonical.end());
++     }
++   }
++ 
++   [[nodiscard]] bool UsesComponentCache() const override { return true; }
++   [[nodiscard]] std::unique_ptr<ComponentCacheResources>
++   CreateComponentCacheResources(cache::ResourceLedger& ledger,
++                                 std::size_t ram) const override {
++     struct Backing {
++       hip::TransferPool streams{64};
++       std::unique_ptr<hip::CommittedBackingPool> pool;
++       std::map<std::uint32_t, std::size_t> component_classes;
++     };
++     auto result = std::make_unique<ComponentCacheResources>();
++     auto adapter =
++         std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
++             model_,
++             use_mtp_ ? core::SessionMode::kSpeculative
++                      : core::SessionMode::kAutoregressive,
++             max_context_, component_identity_);
++     (void)ram;  // Backing sizing follows actual slot allocation below.
++     result->adapter = std::move(adapter);
++     auto backing = std::make_shared<Backing>();
++     result->transfer_batch_size = 16;
++     const auto rounded = [](std::size_t bytes) {
++       return (bytes + 4095) / 4096 * 4096;
++     };
++     for (const auto& d : result->adapter->Components()) {
++       const auto bytes = rounded(d.kind == cache::ComponentKind::kPrivateState
++                                      ? d.state_bytes
++                                      : d.row_bytes * d.rows_per_chunk);
++       backing->component_classes.emplace(d.id.value, bytes);
++     }
++     // The remainder belongs to index, histories, disk catalog and queue
++     // metadata. The pools charge their own per-block allocator headroom.
++     result->commit_backing = [backing, &ledger,
++                               adapter =
++                                   result->adapter.get()](std::size_t budget) {
++       const auto plan =
++           static_cast<models::qwen38_flash_next::ContinuationAdapter*>(adapter)
++               ->BackingPlan(budget);
++       if (plan.size() != 1)
++         throw std::invalid_argument("insufficient component backing budget");
++       const auto& allocation = plan.front();
++       // Pages commit as captures need them. A payload cannot span segments,
++       // so the edge of each one strands space a ~140 MB private state cannot
++       // use; equal segments of about 1 GiB, and at least two private states,
++       // keep that small. A step costs about 200 ms of page faults and pinning
++       // (more when the host must reclaim page cache), so it runs ahead on a
++       // background thread; only a capture that outruns it grows on its own
++       // thread. Growth stops early when the host would keep less than its
++       // reserve.
++       std::size_t largest = 0;
++       for (const auto& [id, bytes] : backing->component_classes)
++         largest = std::max(largest, bytes);
++       const auto block = allocation.block_bytes;
++       const auto target =
++           std::max<std::size_t>(std::size_t{1} << 30, 2 * largest) / block;
++       const auto parts =
++           std::max<std::size_t>((allocation.blocks + target - 1) / target, 1);
++       const auto segment = (allocation.blocks + parts - 1) / parts * block;
++       struct Limited {
++         std::mutex mutex;
++         std::chrono::steady_clock::time_point refused;
++         bool active{};
++       };
++       backing->pool = std::make_unique<hip::CommittedBackingPool>(
++           ledger,
++           hip::BackingPoolConfig{
++               allocation.blocks * allocation.block_bytes +
++                   allocation.metadata_bytes,
++               allocation.block_bytes, allocation.metadata_bytes, segment,
++               [limited = std::make_shared<Limited>()](std::size_t bytes) {
++                 const std::lock_guard lock(limited->mutex);
++                 const auto now = std::chrono::steady_clock::now();
++                 // Pressure retries ask once per capture; recheck at most
++                 // once a second while the host is short.
++                 if (limited->active &&
++                     now - limited->refused < std::chrono::seconds(1))
++                   return false;
++                 const auto ceiling = HostSnapshotCeilingBytes();
++                 // Pinned host pages come out of the same device heap that
++                 // session and scratch allocations draw on; keep its dispatch
++                 // reserve so they do not fall back to managed memory.
++                 std::size_t heap_free = 0, heap_total = 0;
++                 const bool heap_fits =
++                     hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
++                     hip::HeapFitsAboveReserve(heap_free, bytes);
++                 if (ceiling >= bytes && heap_fits) {
++                   limited->active = false;
++                   return true;
++                 }
++                 if (!limited->active)
++                   Logger::Warn(
++                       "cache",
++                       "schema=component-cache-v1 "
++                       "event=backing_limited reason=" +
++                           std::string(heap_fits ? "host_reserve "
++                                                 : "device_heap_reserve ") +
++                           "segment_bytes=" + std::to_string(bytes) +
++                           " host_headroom_bytes=" + std::to_string(ceiling) +
++                           " device_heap_free_bytes=" +
++                           std::to_string(heap_free));
++                 limited->active = true;
++                 limited->refused = now;
++                 return false;
++               }});
++       // The first capture would otherwise commit the first segment on the
++       // request path (seconds while the host reclaims page cache).
++       backing->pool->GrowAhead();
++     };
++     result->owner = backing;
++     result->stream = [backing]() -> std::unique_ptr<cache::Stream> {
++       return backing->streams.TryAcquire();
++     };
++     result->allocate = [backing](const cache::PayloadRequest& request) {
++       // Bound the logical capture, then assign whole shared backing pages.
++       const auto capacity =
++           backing->component_classes.at(request.component.value);
++       if (request.bytes > capacity)
++         throw std::logic_error("component capture exceeds its backing class");
++       const auto category =
++           request.category == cache::ResourceCategory::kBackingAssigned
++               ? cache::ResourceCategory::kBackingAssigned
++               : request.category;
++       const auto segments = backing->pool->PageCommitAllocations();
++       const auto started = std::chrono::steady_clock::now();
++       auto block = backing->pool->TryAcquire(category, request.bytes);
++       if (backing->pool->PageCommitAllocations() != segments)
++         Logger::Info(
++             "cache",
++             "schema=component-cache-v1 event=backing_grown committed_bytes=" +
++                 std::to_string(backing->pool->CommittedBytes()) + " segments=" +
++                 std::to_string(backing->pool->PageCommitAllocations()) +
++                 " acquire_ms=" +
++                 std::to_string(std::chrono::duration<double, std::milli>(
++                                    std::chrono::steady_clock::now() - started)
++                                    .count()));
++       if (!block)
++         throw cache::ResourceExhausted();
++       // Commit the next segment off the capturing thread, which otherwise
++       // stalls this and every peer request for the allocation (up to seconds
++       // while the host reclaims page cache).
++       backing->pool->GrowAhead();
++       auto owner = std::make_shared<hip::BackingBlock>(std::move(*block));
++       return ComponentCaptureBuffer{
++           owner->Bytes(),
++           [owner] {
++             owner->Convert();
++             return std::move(*owner).TakePayload();
++           },
++           backing->pool.get(),
++           [owner, request](cache::SlotLease& lease, auto source) {
++             return cache::Payload::Borrowed(std::move(*owner).Borrow(
++                 lease, request.component, request.first, request.end,
++                 request.bytes, source));
++           }};
++     };
++     result->staging = [](std::size_t bytes) {
++       void* data = nullptr;
++       const auto status = hipHostMalloc(&data, bytes, hipHostMallocCoherent);
++       if (status != hipSuccess)
++         throw std::runtime_error(hipGetErrorString(status));
++       auto owner = std::shared_ptr<void>(
++           data, [](void* value) { (void)hipHostFree(value); });
++       std::memset(data, 0, bytes);
++       return cache::StagingAllocation{
++           std::move(owner), {static_cast<std::uint8_t*>(data), bytes}};
++     };
++     result->copy_observed_rows = [](auto source, auto destination,
++                                     cache::Stream& stream) {
++       return dynamic_cast<hip::TransferStream&>(stream).Copy(
++           destination.data(), source.data(), destination.size(),
++           hip::CopyDirection::kDeviceToHost, destination.size());
++     };
++     return result;
++   }
++   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
++       cache::Adapter& adapter, cache::Slot& slot) const override {
++     auto& flash =
++         dynamic_cast<models::qwen38_flash_next::ContinuationAdapter&>(adapter);
++     return std::make_unique<QwenFlashNextTextRunnerState>(
++         flash.GetSession(slot), adapter, slot);
++   }
++   void ReconcileComponentState(TextRunnerState& state,
++                                std::size_t position) const override {
++     RequireQwenFlashNextState(state).set_position(position);
+    }
+  
+    [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+@@@ -3202,8 -3064,8 +3390,9 @@@ private
+    std::uint32_t max_context_;
+    bool use_mtp_;
+    std::uint32_t max_draft_tokens_;
+ +  bool distributed_{false};
+    std::optional<TextRunnerPersistenceDescriptor> persistence_;
++   cache::Identity component_identity_;
+  };
+  #endif
+  
+diff --cc src/models/qwen38_flash_next/kernels/rocm/device_model.cpp
+index ff44b8be,3f08a058..00000000
+--- a/src/models/qwen38_flash_next/kernels/rocm/device_model.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/device_model.cpp
+@@@ -3,12 -3,12 +3,14 @@@
+  #include <hip/hip_runtime.h>
+  
+  #include <algorithm>
++ #include <cassert>
+  #include <initializer_list>
+ +#include <limits>
+  #include <utility>
+  
++ #include "src/core/hip/managed_alloc.hpp"
+  #include "src/core/hip/weight_upload.hpp"
+ +#include "src/core/quant/ggml_dequant.hpp"
+  #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+  #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+  
+@@@ -28,46 -28,21 +30,59 @@@ struct Conversion 
+    std::size_t count;
+  };
+  
+ +/// Whether every trunk layer's GDN or attention heads split evenly across
+ +/// `world` ranks with whole query groups, and every piece is whole rows or
+ +/// whole quantization blocks of Q8_0 projections.
+ +bool SplitMixersFit(const ModelWeights& w, std::uint32_t world,
+ +                    std::string* why) {
+ +  const Config& c = w.config;
+ +  if (c.ssm_num_k_heads == 0 || c.ssm_num_k_heads % world != 0 ||
+ +      c.ssm_num_v_heads % c.ssm_num_k_heads != 0 || c.num_kv_heads == 0 ||
+ +      c.num_kv_heads % world != 0 || c.num_heads % c.num_kv_heads != 0 ||
+ +      c.ssm_head_dim % 32 != 0 || c.head_dim % 32 != 0) {
+ +    *why = "head counts";
+ +    return false;
+ +  }
+ +  const auto q8 = [](const TensorRef& t) {
+ +    return !t.empty() && t.type == core::GgmlType::kQ8_0;
+ +  };
+ +  for (const auto& l : w.layers) {
+ +    const bool fits =
+ +        l.linear ? q8(l.ssm_qkv) && q8(l.ssm_gate) && q8(l.ssm_out) &&
+ +                       l.ssm_qkv.cols == l.ssm_gate.cols &&
+ +                       (l.ssm_alpha.type == core::GgmlType::kF32 ||
+ +                        l.ssm_alpha.type == core::GgmlType::kQ8_0) &&
+ +                       l.ssm_beta.type == l.ssm_alpha.type &&
+ +                       l.ssm_beta.cols == l.ssm_alpha.cols &&
+ +                       l.ssm_conv1d.type == core::GgmlType::kF32 &&
+ +                       l.ssm_dt.type == core::GgmlType::kF32 &&
+ +                       l.ssm_a.type == core::GgmlType::kF32
+ +                 : q8(l.attn_q) && q8(l.attn_k) && q8(l.attn_v) &&
+ +                       q8(l.attn_out) && l.attn_q.cols == l.attn_k.cols &&
+ +                       l.attn_q.cols == l.attn_v.cols;
+ +    if (!fits) {
+ +      *why = "projection types of a trunk layer";
+ +      return false;
+ +    }
+ +  }
+ +  return true;
+ +}
+ +
++ /// The trunk and the optional MTP block as one traversal's output.
++ struct Uploaded {
++   DeviceTensor token_embd;
++   DeviceTensor output;
++   DeviceMixer hc_head;
++   std::vector<DeviceLayer> layers;
++   DeviceLayer mtp;
++ };
++ 
++ /// Walks the model's tensors in upload order. With `weights` null the walk
++ /// only measures: it sums the bytes every allocation would request and does
++ /// no device work, so the weight placement can be decided from the tensors.
+  struct Uploader {
+    hip::WeightUpload& stager;
++   const hip::WeightAllocator* weights;
+    std::vector<Conversion>& conversions;
+    std::vector<void*>& allocations;
+    std::size_t& bytes;
+@@@ -76,8 -51,9 +91,11 @@@
+    std::string* error;
+    bool ok{true};
+    std::uint32_t shard_base{0};
+ +  const distributed::TpPartition* partition{nullptr};
+ +  const Config* config{nullptr};
++   std::uint64_t requested{0};
++ 
++   [[nodiscard]] bool Measuring() const noexcept { return weights == nullptr; }
+  
+    void Fail(const std::string& message) {
+      if (ok && error != nullptr) {
+@@@ -86,35 -62,32 +104,46 @@@
+      ok = false;
+    }
+  
++   [[nodiscard]] hipError_t Allocate(void** pointer, std::size_t size) {
++     requested += size;
++     if (Measuring()) {
++       return hipSuccess;
++     }
++     return weights->Allocate(pointer, size);
++   }
++ 
+ -  DeviceTensor Copy(const TensorRef& t) {
+ +  DeviceTensor CopyRange(const TensorRef& t, std::uint64_t relative_offset,
+ +                         std::size_t size, std::uint32_t experts) {
+      DeviceTensor d;
+      if (t.empty() || !ok) {
+        return d;
+      }
+ -    const std::size_t size = t.SizeBytes();
+ +    const std::size_t tensor_bytes = t.SizeBytes();
+ +    if (size > tensor_bytes || relative_offset > tensor_bytes - size ||
+ +        size > std::numeric_limits<std::size_t>::max() - kTailMargin ||
+ +        t.cols > std::numeric_limits<std::uint32_t>::max() ||
+ +        t.rows > std::numeric_limits<std::uint32_t>::max()) {
+ +      Fail("weight range geometry is invalid for " + std::string(t.name));
+ +      return d;
+ +    }
+ +    if (relative_offset >
+ +        std::numeric_limits<std::uint64_t>::max() - t.file_offset) {
+ +      Fail("weight range offset overflow for " + std::string(t.name));
+ +      return d;
+ +    }
+      void* ptr = nullptr;
+-     if (hipMalloc(&ptr, size + kTailMargin) != hipSuccess) {
+-       Fail("hipMalloc failed for " + std::string(t.name) + " (" +
++     if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
++       Fail("device allocation failed for " + std::string(t.name) + " (" +
+             std::to_string(size) + " bytes)");
+        return d;
+      }
++     if (Measuring()) {
++       return d;
++     }
+      allocations.push_back(ptr);
+      bytes += size + kTailMargin;
+ -    if (!stager.Copy(shard_base + t.shard, t.file_offset, size, ptr, error)) {
+ +    if (!stager.Copy(shard_base + t.shard, t.file_offset + relative_offset,
+ +                     size, ptr, error)) {
+        Fail("upload failed for " + std::string(t.name) +
+             (error != nullptr ? ": " + *error : std::string()));
+        return d;
+@@@ -760,55 -369,28 +824,80 @@@ std::unique_ptr<DeviceModel> DeviceMode
+    if (!stager) {
+      return nullptr;
+    }
+++<<<<<<< HEAD
+ +  std::vector<Conversion> conversions;
+ +  Uploader up{*stager,
+ +              conversions,
+ +              m->allocations_,
+ +              m->bytes_,
+ +              m->max_half_cols_,
+ +              m->max_q8_cols_,
+ +              error_msg,
+ +              true,
+ +              0,
+ +              partition,
+ +              &m->config_};
+ +  // Under TP every trunk layer's GDN or attention heads are split across the
+ +  // ranks; the draft block, which runs one short step at a time, is not.
+ +  const MixerHeads all = MixerHeads::All(w.config);
+ +  m->trunk_split_ = partition != nullptr && partition->distributed();
+ +  m->trunk_heads_ = all;
+ +  if (m->trunk_split_) {
+ +    std::string why;
+ +    if (!SplitMixersFit(w, partition->world_size, &why)) {
+ +      if (error_msg != nullptr) {
+ +        *error_msg = "TP head split does not fit the model: " + why;
+ +      }
+ +      return nullptr;
+ +    }
+ +    const std::uint32_t world = partition->world_size;
+ +    m->trunk_heads_.ssm_k /= world;
+ +    m->trunk_heads_.ssm_v /= world;
+ +    m->trunk_heads_.attn /= world;
+ +    m->trunk_heads_.attn_kv /= world;
+ +  }
+ +  m->token_embd_ = up.Copy(w.token_embd);
+ +  m->output_ =
+ +      w.output.data == w.token_embd.data ? m->token_embd_ : up.Copy(w.output);
+ +  m->hc_head_ = up.Mixer(w.hc_head);
+ +  m->layers_.reserve(w.layers.size());
+ +  for (const auto& l : w.layers) {
+ +    m->layers_.push_back(up.Layer(l, m->trunk_heads_, m->trunk_split_));
+ +    if (!up.ok) {
+++=======
++   // Measure first: the placement is decided once, from the bytes this walk
++   // will request of the device heap.
++   std::uint64_t measured = 0;
++   {
++     std::vector<Conversion> conversions;
++     std::vector<void*> allocations;
++     std::size_t bytes = 0;
++     std::size_t max_half_cols = 1;
++     std::size_t max_q8_cols = 32;
++     Uploader measure{*stager, nullptr,       conversions, allocations,
++                      bytes,   max_half_cols, max_q8_cols, error_msg};
++     (void)measure.Model(w, mtp, shard_count);
++     if (!measure.ok) {
+++>>>>>>> origin/main
+        return nullptr;
+      }
++     measured = measure.requested;
+    }
+++<<<<<<< HEAD
+ +  if (mtp != nullptr) {
+ +    // The sidecar has its own shard index; reuse the target's readers and
+ +    // staging pool.
+ +    up.shard_base = shard_count;
+ +    m->mtp_ = up.Layer(mtp->block, all, false);
+ +    m->has_mtp_ = true;
+ +  }
+++=======
++   const hip::WeightAllocator weights(measured);
++   std::vector<Conversion> conversions;
++   Uploader up{*stager,   &weights,          conversions,     m->allocations_,
++               m->bytes_, m->max_half_cols_, m->max_q8_cols_, error_msg};
++   Uploaded uploaded = up.Model(w, mtp, shard_count);
+++>>>>>>> origin/main
+    if (!up.ok || !stager->Finish(error_msg)) {
+      return nullptr;
+    }
+diff --cc src/models/qwen38_flash_next/kernels/rocm/executor.cpp
+index 15a23d28,a82cce1f..00000000
+--- a/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
+@@@ -1346,11 -1309,12 +1348,12 @@@ bool Executor::EnsureRollback(Session& 
+    session.rollback_allocations_.reserve(depth);
+    session.ngram_snapshots_.resize(depth);
+    for (auto row = session.rollback_depth_; row < depth; ++row) {
+ -    const auto state = GdnRollbackRowFloats(row, c.ssm_num_k_heads,
+ -                                            c.ssm_num_v_heads, c.ssm_head_dim);
+ +    const auto state =
+ +        GdnRollbackRowFloats(row, heads.ssm_k, heads.ssm_v, heads.ssm_dim);
+      const auto bytes = (linear * (conv + state) + ple) * sizeof(float);
+      float* allocation = nullptr;
+-     if (!Check(hipMalloc(&allocation, bytes), "rollback allocation", error_msg))
++     if (!Check(hip::AllocateDevice(&allocation, bytes), "rollback allocation",
++                error_msg))
+        return false;
+      session.rollback_allocations_.push_back(allocation);
+      session.rollback_bytes_ += bytes;
+@@@ -1690,8 -1650,6 +1694,11 @@@ bool Executor::RouteHints(std::uint32_
+    routed_64_tiles_ = 0;
+    routed_pair_tiles_ = 0;
+    routed_pair_offset_ = 0;
+++<<<<<<< HEAD
+ +  routed_pair_rows_ = 64;
+ +  routed_n_tiles_ = 0;
+++=======
+++>>>>>>> origin/main
+    if (!ExpertMatrixRows(n_tokens)) {
+      return true;
+    }
+@@@ -1704,43 -1663,30 +1712,30 @@@
+    std::uint32_t max_rows = 0;
+    std::uint32_t n_tiles = 0;
+    routed_tile_rows_ = RoutedTileRows(
+ -      static_cast<std::size_t>(n_tokens) * c.num_experts_used, c);
+ +      static_cast<std::size_t>(n_tokens) * c.num_experts_used, c.num_experts);
+    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+-     const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
+      max_rows = std::max(max_rows, counts_host_[e]);
+-     for (std::uint32_t j = 0;
+-          j < (padded + routed_tile_rows_ - 1) / routed_tile_rows_; ++j) {
+-       tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+-     }
+    }
+    routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
+-   routed_n_tiles_ = n_tiles;
+-   // Append the 64-token map for gate/up and eligible down projections.
+-   // Wide expert buckets also get a 128-token gate/up map: it amortizes
+-   // weight decoding, while short buckets retain the cheaper 64-token tile.
+-   if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
++   const auto append = [&](std::uint32_t tile_rows) {
+      for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+-       const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
+-       for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
++       for (std::uint32_t j = 0;
++            j < (counts_host_[e] + tile_rows - 1) / tile_rows; ++j) {
+          tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+-     }
+-     routed_64_tiles_ = n_tiles - routed_n_tiles_;
+-     routed_pair_offset_ = routed_n_tiles_;
+-     routed_pair_tiles_ = routed_64_tiles_;
+-     std::uint32_t tiles_128 = 0;
+-     for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+-       tiles_128 += (counts_host_[e] + 127u) / 128u;
+-     }
+-     if (tiles_128 * 4 <= routed_64_tiles_ * 3) {
+-       routed_pair_rows_ = 128;
+-       routed_pair_offset_ = n_tiles;
+-       routed_pair_tiles_ = tiles_128;
+-       for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+-         for (std::uint32_t j = 0; j < (counts_host_[e] + 127u) / 128u; ++j) {
+-           tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+-         }
+        }
+      }
++   };
++   if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
++     // Wide batches: 64-token tiles for the down projection, then 128-token
++     // tiles for the paired gate/up projections.
++     append(64);
++     routed_64_tiles_ = n_tiles;
++     routed_pair_offset_ = n_tiles;
++     append(128);
++     routed_pair_tiles_ = n_tiles - routed_pair_offset_;
++   } else {
++     append(routed_tile_rows_);
++     routed_n_tiles_ = n_tiles;
+    }
+    routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
+        counts_host_, static_cast<int>(c.num_experts));
+@@@ -2683,12 -2526,20 +2724,23 @@@ bool Executor::Moe(const DeviceLayer& l
+        throw;
+      }
+    }
+ -  return MoeExperts(l, x, out, n_tokens, error_msg);
+ +  if (!MoeExperts(l, x, out, n_tokens, error_msg)) {
+ +    return false;
+ +  }
+ +  return !reduce || AllReduce(out, n_tokens, error_msg);
+  }
+  
++ bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
++   const Config& c = config();
++   return ExpertMatrixRows(n_tokens) &&
++          (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
++           l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
++          l.ffn_up_exps.type == l.ffn_gate_exps.type &&
++          (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
++           l.ffn_down_exps.type == GgmlType::kQ8_0) &&
++          c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
++ }
++ 
+  bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
+                            std::uint32_t n_tokens,
+                            std::string* error_msg) const {
+@@@ -2704,14 -2552,7 +2756,18 @@@
+    // Tiled batches take the WMMA route: assignments compacted by expert
+    // into 16-row padded buckets, token rows narrowed to F16 once, then the
+    // F16 matrix-core GEMM per (expert, row tile).
+++<<<<<<< HEAD
+ +  const bool wmma_experts = ExpertMatrixRows(n_tokens) &&
+ +                            (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
+ +                             l.ffn_gate_exps.type == GgmlType::kQ5_K ||
+ +                             l.ffn_gate_exps.type == GgmlType::kQ8_0) &&
+ +                            l.ffn_up_exps.type == l.ffn_gate_exps.type &&
+ +                            (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
+ +                             l.ffn_down_exps.type == GgmlType::kQ8_0) &&
+ +                            c.hidden_size % 256 == 0 && expert_ff % 64 == 0;
+++=======
++   const bool wmma_experts = WmmaExperts(l, n_tokens);
+++>>>>>>> origin/main
+    if (wmma_experts) {
+      RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds, s_.routed_cursors,
+                    s_.rows_token, s_.rows_slot, n_tokens, used, c.num_experts,
+@@@ -2741,8 -2581,8 +2797,13 @@@
+              ? RoutedGatedF16Gemm(
+                    l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
+                    s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
+++<<<<<<< HEAD
+ +                  routed_pair_rows_, s_.routed_bounds, s_.rows_token,
+ +                  s_.rows_slot, up_half, expert_ff, c.hidden_size, stream_)
+++=======
++                   s_.routed_bounds, s_.rows_token, s_.rows_slot, up_half,
++                   c.expert_ff, c.hidden_size, stream_)
+++>>>>>>> origin/main
+              : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
+                               s_.routed_tiles, routed_n_tiles_,
+                               routed_tile_rows_, s_.routed_bounds, s_.rows_token,
+@@@ -3172,10 -2970,32 +3230,21 @@@ bool Executor::ForwardBody(Session& ses
+      const bool last_attention = prefill_phase && !session.mtp_enabled_ &&
+                                  il + 1 == c.num_layers && n >= 1024 &&
+                                  n_logits == 1 && checkpoint == nullptr;
+ -    if (l.linear) {
+ -      const auto capture =
+ -          checkpoint ? GdnCheckpoint{checkpoint->state->linear_[il].state,
+ -                                     checkpoint->state->linear_[il].conv_state,
+ -                                     checkpoint->tokens}
+ -                     : GdnCheckpoint{};
+ -      if (!LinearAttention(l, session.linear_[il], s_.mixed, s_.block_out, n,
+ -                           speculative, error_msg, false, true, capture)) {
+ -        return false;
+ -      }
+ -    } else if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
+ -                          &session.control_->position,
+ -                          &session.control_->blocks, start_pos, pool_grid,
+ -                          session.max_context_, sparse, error_msg,
+ -                          last_attention, false, true,
+ -                          checkpoint ? checkpoint->tokens : 0)) {
+ +    if (!MixerPart(session, il, batch, normed, true, error_msg, checkpoint,
+ +                   last_attention)) {
+        return false;
+      }
+++<<<<<<< HEAD
+++=======
++ 
++     const float* next_norm =
++         il + 1 < c.num_layers
++             ? (c.IsPleLayer(il + 1) ? nullptr
++                                     : layers[il + 1].hc_attn.norm.f32())
++             : nullptr;
++     const float* next_inject =
++         next_norm != nullptr ? InjectWeights(layers[il + 1].hc_attn) : nullptr;
+++>>>>>>> origin/main
+      // Cache updates precede the FFN. Without MTP, only requested head rows
+      // and the checkpoint frontier consume the final layer's residual.
+      // Keep aligned tiles and at least 96 rows to retain the wide arithmetic.
+@@@ -3186,6 -3005,23 +3255,26 @@@
+                                   il + 1 == c.num_layers && n > needed
+                               ? (n - needed) / 128 * 128
+                               : 0U;
+++<<<<<<< HEAD
+++=======
++     const auto finish = [&](std::uint32_t rows) {
++       defer_residual_ = WmmaExperts(l, rows);
++       // The wide FFN reads the mix only through its F16 rows (router, routed
++       // experts) and tiled Q8 rows (shared expert).
++       const bool no_f32 = prefill_phase && defer_residual_ &&
++                           rows <= options_.max_batch &&
++                           l.router.type == GgmlType::kF16 &&
++                           l.shexp_gate.type == GgmlType::kQ8_0 &&
++                           l.shexp_up.type == GgmlType::kQ8_0;
++       Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn));
++       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
++                  false, no_f32) ||
++           !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
++         return false;
++       Combine(s_.res, next_norm, rows, next_inject);
++       return true;
++     };
+++>>>>>>> origin/main
+      if (skipped != 0) {
+        struct RestoreScratch {
+          const Executor* executor;
+diff --cc src/models/qwen38_flash_next/kernels/rocm/executor.hpp
+index d6ca5f12,b92ad478..00000000
+--- a/src/models/qwen38_flash_next/kernels/rocm/executor.hpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/executor.hpp
+@@@ -572,14 -505,12 +577,17 @@@ private
+                   bool last_only = false, bool projections_ready = false,
+                   bool project_output = true,
+                   std::uint32_t checkpoint_tokens = 0) const;
+ +  /// Without `reduce`, a distributed rank's output stays its partial.
+    bool Moe(const DeviceLayer& l, const float* x, float* out,
+             std::uint32_t n_tokens, std::string* error_msg,
+ -           bool last_only = false) const;
+ +           bool last_only = false, bool reduce = true) const;
+ +  /// Sums `rows` rows of a partial across ranks; `observe` reports a MoE
+ +  /// output to options_.moe_observer.
+ +  bool AllReduce(float* data, std::size_t rows, std::string* error_msg,
+ +                 bool observe = true) const;
++   /// Whether MoeExperts takes the routed F16 WMMA route, whose epilogue the
++   /// following combine absorbs (see Moe).
++   bool WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const;
+    /// Runs routed experts after the router and shared expert are ready.
+    bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
+                    std::uint32_t n_tokens, std::string* error_msg) const;
+diff --cc src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp
+index 45ca34c4,2f423321..00000000
+--- a/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp
+@@@ -3472,8 -3556,7 +3635,12 @@@ constexpr std::uint32_t kWmmaMaxMaskWor
+  /// tiles are gathered from the union of the block's query selections and
+  /// four selections overlap far less than 32 (measured at 16k depth: 846
+  /// versus 2,478 selected blocks against 512 per query).
+++<<<<<<< HEAD
+ +template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kPackHeads,
+ +         bool kLateV = false, std::uint32_t kKvHeads = kWmmaKvHeads>
+++=======
++ template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kPackHeads>
+++>>>>>>> origin/main
+  __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
+      const float* __restrict__ q, const float* __restrict__ gate,
+      const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
+@@@ -5531,16 -5838,16 +5923,29 @@@ bool RoutedF16Gemm(const void* w, Weigh
+    }
+  }
+  
+++<<<<<<< HEAD
+ +template<int BN>
+ +bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
+ +                          const __half* x, const std::int32_t* tiles,
+ +                          std::uint32_t n_tiles, const std::int32_t* pad_bounds,
+ +                          const std::int32_t* rows_in,
+ +                          const std::int32_t* rows_out, __half* out,
+ +                          std::size_t m, std::size_t k, hipStream_t stream) {
+ +  const std::size_t block_elems = type == WeightType::kQ8_0 ? 64 : 256;
+ +  if (m == 0 || k == 0 || k % block_elems != 0 || n_tiles == 0 ||
+ +      out == nullptr) {
+++=======
++ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
++                         const __half* x, const std::int32_t* tiles,
++                         std::uint32_t n_tiles, const std::int32_t* pad_bounds,
++                         const std::int32_t* rows_in,
++                         const std::int32_t* rows_out, __half* out,
++                         std::size_t m, std::size_t k, hipStream_t stream) {
++   // 128-token tiles decode each expert's weights once per wide bucket; at
++   // 1024+ batch rows they also beat 64-token tiles on short buckets.
++   constexpr int BN = 128;
++   if (m == 0 || k == 0 || k % 256 != 0 || n_tiles == 0 || out == nullptr) {
+++>>>>>>> origin/main
+      return false;
+    }
+    const dim3 grid(static_cast<unsigned int>((m + 63) / 64), n_tiles);
+@@@ -6416,12 -6736,11 +6867,11 @@@ bool DenseF16SsmGemm(const void* w, con
+                       dim3((n_tokens + 127) / 128, m / 256), dim3(kThreads), 0,
+                       stream, w, x, qkvz, n_tokens, m, k, nullptr, nullptr,
+                       nullptr, conv_w, convolved, AttentionProjectionOutput{},
+ -                     checkpoint_tokens);
+ +                     channels, checkpoint_tokens);
+    hipLaunchKernelGGL(
+        SsmConvBoundaryKernel,
+-       dim3(Blocks(channels),
+-            (n_tokens + kSsmProjectionTileTokens - 1) / kSsmProjectionTileTokens,
+-            3),
++       dim3(Blocks(channels / 4), (n_tokens + kSsmProjectionTileTokens - 1) /
++                                      kSsmProjectionTileTokens),
+        dim3(kThreads), 0, stream, qkvz, conv_w, history, convolved, n_tokens,
+        channels, m);
+    return true;
+@@@ -6826,32 -7143,11 +7276,40 @@@ bool WmmaCausalAttention(const float* q
+          last_only ? (n_tokens - 1) / kPackedQueries : 0;
+      const dim3 grid(
+          (n_tokens + kPackedQueries - 1) / kPackedQueries - first_group,
+++<<<<<<< HEAD
+ +        kv_heads);
+ +    // At deep sparse windows, staging the current V before fetching the
+ +    // next one shortens their overlapping register lifetimes.
+ +    const bool late = start_pos >= 65536;
+ +    if (kv_heads == 1 && late) {
+ +      hipLaunchKernelGGL(
+ +          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true, 1>),
+ +          grid, dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
+ +          mask_words, out, start_pos, n_tokens, first_group);
+ +    } else if (kv_heads == 1) {
+ +      hipLaunchKernelGGL((WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys,
+ +                                                    true, false, 1>),
+ +                         grid, dim3(kThreads), 0, stream, q, gate, k_cache,
+ +                         v_cache, mask, mask_words, out, start_pos, n_tokens,
+ +                         first_group);
+ +    } else if (late) {
+ +      hipLaunchKernelGGL(
+ +          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true>),
+ +          grid, dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
+ +          mask_words, out, start_pos, n_tokens, first_group);
+ +    } else {
+ +      hipLaunchKernelGGL(
+ +          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
+ +          dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
+ +          mask_words, out, start_pos, n_tokens, first_group);
+ +    }
+++=======
++         kWmmaKvHeads);
++     hipLaunchKernelGGL(
++         (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
++         dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
++         out, start_pos, n_tokens, first_group);
+++>>>>>>> origin/main
+      return true;
+    }
+    const std::uint32_t first_group =
+diff --cc src/models/qwen38_flash_next/kernels/rocm/kernels.hpp
+index 6367b909,fe6ba2ef..00000000
+--- a/src/models/qwen38_flash_next/kernels/rocm/kernels.hpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/kernels.hpp
+@@@ -264,14 -280,12 +282,13 @@@ bool RoutedF16Gemm(const void* w, Weigh
+                     const float* swiglu_gate, float* out, __half* out_half,
+                     std::size_t m, std::size_t k, hipStream_t stream);
+  
+ -/// Paired Q4_K/Q5_K gate/up GEMM with SwiGLU and F16 output. Uses the same
+ -/// routing layout as RoutedF16Gemm, with 128 token rows per tile. The two
+ -/// projections share one launch and never materialize the gate output.
+ +/// Paired Q4_K/Q5_K/Q8_0 gate/up GEMM with SwiGLU and F16 output. Uses the
+ +/// same routing layout as RoutedF16Gemm, with 64 or 128 token rows per tile.
+ +/// The two projections share one launch and never materialize the gate
+ +/// output. Q8_0 needs k % 64 == 0, the K-quants k % 256 == 0.
+  bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
+                          const __half* x, const std::int32_t* tiles,
+-                         std::uint32_t n_tiles, std::uint32_t tile_rows,
+-                         const std::int32_t* pad_bounds,
++                         std::uint32_t n_tiles, const std::int32_t* pad_bounds,
+                          const std::int32_t* rows_in,
+                          const std::int32_t* rows_out, __half* out,
+                          std::size_t m, std::size_t k, hipStream_t stream);
+diff --cc tests/models/deepseek_v4_flash/CMakeLists.txt
+index 59f53f7c,3edcf4a4..00000000
+--- a/tests/models/deepseek_v4_flash/CMakeLists.txt
++++ b/tests/models/deepseek_v4_flash/CMakeLists.txt
+@@@ -51,14 -51,12 +51,15 @@@ if(ENGINE_ENABLE_HIP
+      serving_test.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
++     ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
+ +    ${PROJECT_SOURCE_DIR}/src/cli/serve/tp_executor.cpp
+ +    ${PROJECT_SOURCE_DIR}/src/cli/serve/tp_disk_store.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
+    target_link_libraries(ds4_serving_test PRIVATE gufo_logging
+ -    gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next gufo_cache_hip hip::host)
+ +    gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next gufo_tp_control
+-     hip::host)
+++    gufo_cache_hip hip::host)
+    add_test(NAME ds4.serving COMMAND ds4_serving_test)
+    set_tests_properties(ds4.serving PROPERTIES
+      LABELS "gpu;hip;ds4;server;external-model;slow"
+diff --cc tests/models/qwen27b/CMakeLists.txt
+index 78d893b7,fe5c198c..00000000
+--- a/tests/models/qwen27b/CMakeLists.txt
++++ b/tests/models/qwen27b/CMakeLists.txt
+@@@ -37,14 -37,12 +37,15 @@@ if (ENGINE_ENABLE_HIP
+    add_library(qwen_serving_test_support STATIC
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
++     ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
+ +    ${PROJECT_SOURCE_DIR}/src/cli/serve/tp_executor.cpp
+ +    ${PROJECT_SOURCE_DIR}/src/cli/serve/tp_disk_store.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
+    target_link_libraries(qwen_serving_test_support PUBLIC gufo_logging
+ -    gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next gufo_cache_hip hip::host)
+ +    gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next gufo_tp_control
+-     hip::host)
+++    gufo_cache_hip hip::host)
+    add_executable(inference_backend_gpu_test serving_test.cpp)
+    target_link_libraries(inference_backend_gpu_test PRIVATE qwen_serving_test_support)
+    add_executable(qwen_vision_serving_test ../qwen/vision_serving_test.cpp)
+diff --cc tests/models/qwen38_flash_next/CMakeLists.txt
+index dfba5312,ec263ede..00000000
+--- a/tests/models/qwen38_flash_next/CMakeLists.txt
++++ b/tests/models/qwen38_flash_next/CMakeLists.txt
+@@@ -34,13 -32,12 +34,15 @@@ if (ENGINE_ENABLE_HIP
+    add_executable(qwen38_flash_next_session_test EXCLUDE_FROM_ALL session_test.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
++     ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
+ +    ${PROJECT_SOURCE_DIR}/src/cli/serve/tp_executor.cpp
+ +    ${PROJECT_SOURCE_DIR}/src/cli/serve/tp_disk_store.cpp
+      ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
+    target_link_libraries(qwen38_flash_next_session_test PRIVATE gufo_logging
+-     gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_tp_control hip::host)
+ -    gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_cache_hip hip::host)
+++    gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_tp_control
+++    gufo_cache_hip hip::host)
+    add_executable(qwen38_flash_next_snapshot_test EXCLUDE_FROM_ALL snapshot_test.cpp
+      device_headroom_fault.cpp)
+    target_link_libraries(qwen38_flash_next_snapshot_test PRIVATE
