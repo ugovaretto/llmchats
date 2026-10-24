@@ -1,5 +1,7 @@
 # imagegen — Handoff Document
 **Version:** 0.1.6 · **Engine pin:** `0518b34` · **Date:** 2026-10-21
+**Unreleased:** `layout` `/v1/models` extension on `master` after tag `v0.1.6`
+(commit `2e71ac8`; no version bump yet — the next release is expected to be 0.1.7)
 
 ---
 
@@ -17,7 +19,7 @@ An OpenAI-compatible HTTP gateway in front of `sd-server` (stable-diffusion.cpp)
 
 ```bash
 uv sync                          # install deps
-uv run pytest                    # 100 tests, no GPU needed
+uv run pytest                    # 110 tests, no GPU needed
 uv run imagegen serve            # start the gateway (loopback by default)
 uv run imagegen doctor           # validate config, binaries, weights
 uv run imagegen models           # list configured models with sampling
@@ -55,6 +57,28 @@ client ──(bearer token)──> gateway :8080 ──(no credentials)──> s
 - **flux3:** uses Qwen3-VL-4B (embedded tokenizer), FLUX.2 VAE. `dimension_multiple=16` (verified empirically at 1008×1008). Time shift 6.93. Edits use the `flux2` preset (VLM=No) — `supports_editing=true` with `vision_encoder=None`, which the schema now allows.
 - **Z-Image:** uses Qwen3-4B-Instruct-2507 (no mmproj), FLUX.1-schnell autoencoder (`ae.safetensors`). `dimension_multiple=16`. Apache-2.0.
 - **Qwen models:** share Qwen3-VL-8B encoder + mmproj. `dimension_multiple=32`. Turbo has a fixed 9-element sigma schedule.
+
+---
+
+## Discovery: the `layout` extension (unreleased, after v0.1.6)
+
+`GET /v1/models` is the only discovery surface. Each entry MAY carry
+`"layout": "<dialect>"`; absent means "not advertised". **Never `null`** — clients
+distinguish "this model has no layout support" from "this engine predates the
+extension", and `null` erases that difference.
+
+`"moss"` means the checkpoint parses a MOSS layout JSON document as the ordinary
+`prompt` string — `summary.caption`, `items` with `label`/`caption`/`text`/`bbox`,
+`bbox_format: "yxyx"`, `bbox_coord_space: "abs_centralized"` (canvas-centre origin,
+so 1024×1024 spans −512…+512). The gateway parses nothing; it relays the string.
+
+- Set per profile via `layout = "moss"`; shipped on `moss-image` only.
+- Layout support lives in the **weights** (both MOSS Base and SFT document it), so a
+  non-MOSS model must not claim the dialect.
+- Verified end-to-end: the upstream USERGUIDE example layout rendered to its exact
+  bboxes through the real MOSS checkpoint on CUDA (180 s at 1024²).
+- Layout is *experimental* upstream, and bboxes are absolute pixels for one canvas,
+  so a client must generate at the size it computed coordinates for.
 
 ---
 
@@ -114,8 +138,8 @@ Pin moved from `f89d9b1` → `0518b34` (31 commits, ~Oct 10–21). Relevant upst
 ### `[backends]` — 12 keys
 `sd_server_binary` (req), `models_dir` (req), `lifecycle` (eager|on_demand), `max_resident_backends`, `idle_timeout_seconds`, `start_timeout_seconds`, `stop_timeout_seconds`, `offload_to_cpu`, `diffusion_flash_attention`, `max_vram_gib`, `log_level`, `extra_args`
 
-### `[[models]]` — 14 keys
-`id` (req), `diffusion_model` (req), `vae` (req), `text_encoder` (req), `port` (req), `default_size` (req), `max_pixels` (req), `sampling` (req), `description`, `vision_encoder`, `tokenizer` (NEW in 0.1.6), `supports_editing`, `dimension_multiple` (default 32), `max_images_per_request`
+### `[[models]]` — 15 keys
+`id` (req), `diffusion_model` (req), `vae` (req), `text_encoder` (req), `port` (req), `default_size` (req), `max_pixels` (req), `sampling` (req), `description`, `vision_encoder`, `tokenizer` (0.1.6), `supports_editing`, `layout` (unreleased), `dimension_multiple` (default 32), `max_images_per_request`
 
 ### `[models.sampling]` — 7 keys
 `steps` (req), `cfg` (req), `sample_method` (req), `scheduler`, `flow_shift`, `custom_sigmas`, `negative_prompt`

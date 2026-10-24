@@ -6,7 +6,7 @@ You are resuming development on imagegen, an OpenAI-compatible image generation 
 cd /home/ugo/software/imagegen
 uv sync                                    # install deps
 uv run imagegen serve --config config/service.toml   # start gateway
-uv run pytest                              # 100 tests, no GPU needed
+uv run pytest                              # 110 tests, no GPU needed
 uv run imagegen doctor                     # validate
 scripts/fetch_models.sh                    # download all weights (~31.7 GB)
 scripts/build_engine.sh cuda               # rebuild engine (also: vulkan, cpu)
@@ -17,7 +17,7 @@ docker build -t imagegen:latest .          # rebuild Docker image
 
 - **Version:** 0.1.6 · **Engine pin:** `0518b34` (`master-982-0518b34`)
 - **5 served models:** `qwen-image-2.1`, `qwen-image-2.1-turbo`, `z-image-turbo`, `moss-image`, `flux-3-image-klein`
-- **100 tests pass**, smoke tests pass on CUDA + Vulkan
+- **110 tests pass**, smoke tests pass on CUDA + Vulkan
 
 ## Architecture
 
@@ -80,6 +80,15 @@ A `[[models]]` block in both TOML configs. If a new engine flag is needed:
 ## Docker
 
 Single multi-stage image carrying both CUDA and Vulkan engines. Selected at runtime by `IMAGEGEN_BACKEND=cuda|vulkan`. Weights in a named volume, never baked in. Preflight checks empty `/models` and prints the `fetch-models` command.
+
+## Discovery extension (unreleased, on master after v0.1.6)
+
+`GET /v1/models` entries MAY carry `"layout": "<dialect>"` (currently `"moss"` on
+`moss-image`). An absent key means "not advertised"; **never emit `null`**. A MOSS
+layout JSON document travels as the ordinary `prompt` string — the gateway relays
+it and parses nothing. Layout support is a property of the checkpoint, so only MOSS
+may claim the dialect. See README "API" and `docs/architecture.md`
+"What the service advertises".
 
 ## Critical gotchas (learned the hard way)
 
